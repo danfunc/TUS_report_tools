@@ -1,88 +1,228 @@
+import argparse
+import sys
 import re
 import numpy as np
 
-class TypstMathTranspiler:
-    def __init__(self):
-        # Typstの数学関数・定数をNumPyのものにマッピング
-        self.replacements = {
-            r'\bpi\b': 'np.pi',
-            r'\be\b': 'np.e',
-            r'\bsin\b': 'np.sin',
-            r'\bcos\b': 'np.cos',
-            r'\btan\b': 'np.tan',
-            r'\blog\b': 'np.log10', # ボード線図を想定して常用対数に
-            r'\bln\b': 'np.log',
-            r'\bsqrt\b': 'np.sqrt',
-        }
+# ==========================================
+# 1. 字句解析 (Lexer / Tokenizer)
+# ==========================================
+TOKEN_SPEC = [
+    ('NUMBER',   r'\d+(\.\d*)?'),
+    ('SYMBOL',   r'[A-Za-z_][A-Za-z0-9_]*'),
+    ('OP',       r'[+\-*/^=]'),
+    ('SKIP',     r'[ \t]+'),
+    ('MISMATCH', r'.'),
+]
+TOKEN_REGEX = re.compile('|'.join(f'(?P<{pair[0]}>{pair[1]})' for pair in TOKEN_SPEC))
 
-    def transpile(self, typst_expr, variables):
-        """
-        Typstの数式文字列をPythonの実行可能な関数オブジェクトに変換する。
-        
-        :param typst_expr: Typstの数式文字列 (例: "K / (1 + s * T)")
-        :param variables: 変数のリスト (例: ['s', 'K', 'T'])
-        :return: 実行可能な関数 (lambda)
-        """
-        py_expr = typst_expr
-        
-        # 1. 累乗演算子の変換 (Typst: ^ -> Python: **)
-        py_expr = py_expr.replace('^', '**')
+def tokenize(text):
+    tokens = []
+    for match in TOKEN_REGEX.finditer(text):
+        kind = match.lastgroup
+        value = match.group()
+        if kind == 'SKIP': continue
+        if kind == 'MISMATCH': raise SyntaxError(f"Lexer Error: 予期しない文字 '{value}'")
+        tokens.append({'type': kind, 'value': value})
+    return tokens
 
-        # 1.5 暗黙の乗算（スペース）の変換
-        # 肯定先読み (?=...) を使用し、後ろの文字を消費せずに連続マッチさせる
-        py_expr = re.sub(r'([0-9a-zA-Z)])\s+(?=[a-zA-Z(])', r'\1 * ', py_expr)
-        
-        # 2. 定数・関数の置換
-        for pattern, py_func in self.replacements.items():
-            py_expr = re.sub(pattern, py_func, py_expr)
+# ==========================================
+# 2. 構文解析 (Parser / AST Builder)
+# ==========================================
+def build_ast(expr):
+    stack = [[]]
+    buffer = ""
+    def flush():
+        nonlocal buffer
+        if buffer.strip():
+            stack[-1].extend(tokenize(buffer))
+        buffer = ""
 
+    for i, char in enumerate(expr):
+        if char == '(' or  char == '{':
+            flush()
+            stack.append([])
+        elif char == ')' or char == '}':
+            flush()
+            if len(stack) == 1: raise SyntaxError(f"Parser Error: 位置 {i} に予期しない閉じ括弧")
+            group_children = stack.pop()
+            stack[-1].append({'type': 'GROUP', 'children': group_children})
+        else:
+            buffer += char
+
+    flush()
+    if len(stack) > 1: raise SyntaxError("Parser Error: 閉じられていない開き括弧")
+    return stack[0]
+
+# ==========================================
+# 3. 意味解析 & 最適化 (Semantic Analyzer)
+# ==========================================
+FUNCTION_SYMBOLS = {'sin', 'cos', 'tan', 'log', 'ln', 'sqrt'}
+BUILTIN_VALUE_SYMBOLS = {'pi', 'e'}
+
+class SemanticError(Exception): pass
+
+def analyze_semantics(nodes, variables):
+    VALUE_SYMBOLS = BUILTIN_VALUE_SYMBOLS.union(variables)
+    new_nodes = []
+    
+    for i in range(len(nodes)):
+        current = nodes[i]
+        
+        # シンボルの名前解決
+        if current['type'] == 'SYMBOL':
+            sym = current['value']
+            if sym in FUNCTION_SYMBOLS:
+                current['symbol_role'] = 'FUNCTION'
+            elif sym in VALUE_SYMBOLS:
+                current['symbol_role'] = 'VALUE'
+            else:
+                raise SemanticError(f"Semantic Error: 未定義のシンボル '{sym}'。変数なら variables に追加しろ。")
+                
+        elif current['type'] == 'GROUP':
+            current['children'] = analyze_semantics(current['children'], variables)
             
-        # 3. 暗黙の乗算の警告（完全なASTパースなしでは確実な変換が不可能な領域）
-        # 例: 2s -> 2*s など。今回は簡易版のため明示的な * を要求する。
-        if re.search(r'\d[a-zA-Z]', py_expr):
-            print("[警告] 暗黙の乗算(例: 2x)が検出されました。トランスパイルが失敗する可能性があります。明示的に * を使用してください。")
-
-        # 4. lambda式として動的コンパイル
-        args_str = ", ".join(variables)
-        lambda_str = f"lambda {args_str}: {py_expr}"
-
-        print("トラスパイル後表現"+lambda_str)
+        new_nodes.append(current)
         
+        if i + 1 >= len(nodes): continue
+        next_node = nodes[i + 1]
+        
+        # 暗黙の乗算の論理的挿入
+        current_is_value = (current['type'] in ('NUMBER', 'GROUP') or 
+                           (current['type'] == 'SYMBOL' and current.get('symbol_role') == 'VALUE'))
+        next_is_value = next_node['type'] in ('NUMBER', 'SYMBOL', 'GROUP')
+        
+        if current_is_value and next_is_value:
+            new_nodes.append({'type': 'OP', 'value': '*'})
+            
+    return new_nodes
+
+# ==========================================
+# 4. コード生成 (Code Generator)
+# ==========================================
+def generate_code(nodes):
+    """
+    意味解析済みのASTを巡回し、実行可能なPython(NumPy)コード文字列を生成する。
+    """
+    code = ""
+    for node in nodes:
+        if node['type'] == 'GROUP':
+            # 括弧グループは再帰的に生成して () で囲む
+            code += f"({generate_code(node['children'])})"
+        elif node['type'] == 'NUMBER':
+            code += node['value']
+        elif node['type'] == 'OP':
+            # Typstの累乗(^)をPython(**)に変換
+            val = node['value']
+            code += f" ** " if val == '^' else f" {val} "
+        elif node['type'] == 'SYMBOL':
+            sym = node['value']
+            role = node.get('symbol_role')
+            if role == 'FUNCTION':
+                if sym == 'log': code += "np.log10"
+                elif sym == 'ln': code += "np.log"
+                else: code += f"np.{sym}"
+            elif role == 'VALUE':
+                if sym in BUILTIN_VALUE_SYMBOLS:
+                    code += f"np.{sym}"
+                else:
+                    code += sym # ユーザー定義変数はそのまま出力
+    return code
+
+# ==========================================
+# 5. 統合トランスパイラ (The Transpiler)
+# ==========================================
+class TypstMathTranspiler:
+    def transpile(self, typst_expr, variables):
         try:
-            # 評価環境にnumpyを注入
-            compiled_func = eval(lambda_str, {"np": np})
-            print(f"[Transpile Success] {typst_expr}  =>  {lambda_str}")
-            return compiled_func
-        except SyntaxError as e:
-            print(f"[Transpile Error] 構文エラー: {e}\n生成されたコード: {lambda_str}")
+            # フロントエンドからバックエンドへの一連のパスを実行
+            ast = build_ast(typst_expr)
+            ast_semantic = analyze_semantics(ast, variables)
+            py_code_body = generate_code(ast_semantic)
+            
+            # lambda式として組み立て
+            args_str = ", ".join(variables)
+            lambda_str = f"lambda {args_str}: {py_code_body}"
+            
+            print(f"[Compiled] Typst expr:    {typst_expr}")
+            print(f"           Python expr-> lambda({args_str}):")
+            print(f"                            {py_code_body}")
+            
+            # 動的コンパイル
+            return eval(lambda_str, {"np": np})
+            
+        except (SyntaxError, SemanticError) as e:
+            print(f"[Compile Failed] {e}")
             return None
 
+
 # ==========================================
-# 実行テスト（ボード線図の理論式への組み込み）
+# CLI (コマンドラインインターフェース) 実装
 # ==========================================
+def extract_variables(nodes, seen=None):
+    """
+    ASTを巡回し、予約語・組み込み定数以外の未知のシンボルを
+    出現順に変数として抽出する（Auto-Detect機能）
+    """
+    if seen is None:
+        seen = []
+    for n in nodes:
+        if n['type'] == 'SYMBOL':
+            sym = n['value']
+            if sym not in FUNCTION_SYMBOLS and sym not in BUILTIN_VALUE_SYMBOLS and sym not in seen:
+                seen.append(sym)
+        elif n['type'] == 'GROUP':
+            extract_variables(n['children'], seen)
+    return seen
+
 if __name__ == "__main__":
-    transpiler = TypstMathTranspiler()
+    parser = argparse.ArgumentParser(description="Typst Math to Python Transpiler")
+    parser.add_argument("expr", type=str, help="Typstの数式表現 (例: '20 log( K / sqrt(1 + (2 pi f T)^2) )')")
+    parser.add_argument("-v", "--vars", nargs="*", default=None, help="明示的に指定する変数リスト (例: -v f K T)")
+    parser.add_argument("-e", "--eval", nargs="*", type=float, default=None, help="評価用の数値リスト (例: -e 1000 1.0 0.001)")
     
-    # 1次遅れ系の伝達関数からゲイン(dB)を求めるTypstの数式
-    # G(s) = K / (1 + sT), s = j * 2 * pi * f
-    # 絶対値の20log10を取る数式を想定
+    args = parser.parse_args()
     
-    typst_formula = "20 log(K / sqrt(1+(2 pi f T)^2))"
-    
-    # トランスパイル (独立変数は f, パラメータは K, T)
-    theory_func = transpiler.transpile(typst_formula, variables=['f', 'K', 'T'])
-    
-    if theory_func:
-        # 理論カーブの描画用にテストデータを生成
-        f_vals = np.logspace(1, 5, 100) # 10Hz ~ 100kHz
+    try:
+        # 1. パース (AST構築)
+        ast = build_ast(args.expr)
         
-        # K=1 (0dB), T=1/(2*pi*1000) (折点周波数1kHz) として計算
-        K_val = 1.0
-        T_val = 1.0 / (2 * np.pi * 1000)
+        # 2. 変数の決定 (指定がない場合はAuto-Detect)
+        if args.vars is not None:
+            variables = args.vars
+            detect_mode = "Manual"
+        else:
+            variables = extract_variables(ast)
+            detect_mode = "Auto-Detect"
+            
+        # 3. 意味解析 & コード生成
+        ast_semantic = analyze_semantics(ast, variables)
+        py_code_body = generate_code(ast_semantic)
         
-        # ベクトル演算として即座に実行可能
-        gain_db = theory_func(f_vals, K_val, T_val)
+        args_str = ", ".join(variables)
+        lambda_str = f"lambda {args_str}: {py_code_body}"
         
-        print(f"f=10Hz  における理論ゲイン: {gain_db[0]:.2f} dB")
-        print(f"f=1kHz  における理論ゲイン: {gain_db[50]:.2f} dB")
-        print(f"f=100kHzにおける理論ゲイン: {gain_db[-1]:.2f} dB")
+        # 4. 出力フォーマット
+        print("="*50)
+        print(f"【Typst Expression】\n  {args.expr}")
+        print("-" * 50)
+        print(f"【Variables】 ({detect_mode})\n  {variables}")
+        print("-" * 50)
+        print(f"【Python Lambda】\n  {lambda_str}")
+        print("="*50)
+        
+        # 5. (オプション) 評価実行
+        if args.eval:
+            if len(args.eval) != len(variables):
+                print(f"[Error] 変数の数({len(variables)})と引数の数({len(args.eval)})が一致しません。", file=sys.stderr)
+                sys.exit(1)
+                
+            func = eval(lambda_str, {"np": np})
+            result = func(*args.eval)
+            
+            eval_str = ", ".join([f"{var}={val}" for var, val in zip(variables, args.eval)])
+            print(f"【Execution Result】\n  f({eval_str}) -> {result:.4f}")
+            print("="*50)
+
+    except (SyntaxError, SemanticError) as e:
+        print(f"\n[Compile Failed] {e}", file=sys.stderr)
+        sys.exit(1)
