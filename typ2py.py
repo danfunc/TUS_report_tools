@@ -107,6 +107,10 @@ def resolve_subscripts(nodes):
             # 括弧グループの中身も再帰的に解決
             if nodes[i]['type'] == 'GROUP':
                 nodes[i]['children'] = resolve_subscripts(nodes[i]['children'])
+            # SIGMA内部（終端値・body）も再帰的に解決
+            elif nodes[i]['type'] == 'SIGMA':
+                nodes[i]['end_node'] = resolve_subscripts([nodes[i]['end_node']])[0]
+                nodes[i]['body'] = resolve_subscripts(nodes[i]['body'])
             new_nodes.append(nodes[i])
             i += 1
             
@@ -307,21 +311,10 @@ class TypstMathTranspiler:
 # ==========================================
 # CLI (コマンドラインインターフェース) 実装
 # ==========================================
-def extract_variables(nodes, seen=None):
-    """
-    ASTを巡回し、予約語・組み込み定数以外の未知のシンボルを
-    出現順に変数として抽出する（Auto-Detect機能）
-    """
-    if seen is None:
-        seen = []
-    for n in nodes:
-        if n['type'] == 'SYMBOL':
-            sym = n['value']
-            if sym not in FUNCTION_SYMBOLS and sym not in BUILTIN_VALUE_SYMBOLS and sym not in seen:
-                seen.append(sym)
-        elif n['type'] == 'GROUP':
-            extract_variables(n['children'], seen)
-    return seen
+# Auto-Detect用のextract_variablesはファイル先頭で定義済み(SIGMA対応版)。
+# ここに同名のSIGMA非対応版が重複定義されており、Pythonの仕様上それが
+# 後勝ちで有効になっていたため、sum内部だけの変数(例: nやx_1)が
+# Auto-Detectで検出できなくなっていた。重複定義を削除し、先頭の正しい版を使う。
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Typst Math to Python Transpiler")

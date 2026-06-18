@@ -1,6 +1,6 @@
 import timeit
 import numpy as np
-from test_parser import *
+from typ2py import *
 
 # 前回の TypstMathTranspiler クラスがここにある前提
 
