@@ -8,7 +8,7 @@ import numpy as np
 # ==========================================
 TOKEN_SPEC = [
     ('NUMBER',   r'\d+(\.\d*)?'),
-    ('SYMBOL',   r'[A-Za-z_][A-Za-z0-9]*'),
+    ('SYMBOL',   r'[A-Za-z][A-Za-z0-9]*'),
     ('OP',       r'[+\-*/^=_]'),
     ('SKIP',     r'[ \t]+'),
     ('MISMATCH', r'.'),
